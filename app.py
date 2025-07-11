@@ -8,11 +8,15 @@ import inspect
 import secrets
 from loguru import logger
 from pathlib import Path
+from dotenv import load_dotenv
 
 import requests
 from flask import Flask, request, Response, jsonify, stream_with_context, render_template, redirect, session
 from curl_cffi import requests as curl_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# 加载 .env 文件
+load_dotenv()
 
 class Logger:
     def __init__(self, level="INFO", colorize=True, format=None):
@@ -504,6 +508,38 @@ class Utils:
             else:
                 proxy_options["proxies"] = {"https": proxy, "http": proxy}     
         return proxy_options
+
+    @staticmethod
+    def generate_xai_request_id():
+        """生成 x-xai-request-id UUID"""
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def get_statsig_id():
+        """从外部接口获取 x-statsig-id"""
+        try:
+            proxy_options = Utils.get_proxy_options()
+            response = requests.get(
+                "https://rui.soundai.ee/x.php",
+                timeout=10,
+                **proxy_options
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                statsig_id = result.get("x_statsig_id", "")
+                if statsig_id:
+                    logger.info(f"成功获取 x-statsig-id: {statsig_id[:20]}...", "Server")
+                    return statsig_id
+                else:
+                    logger.error("返回的 x-statsig-id 为空", "Server")
+                    return None
+            else:
+                logger.error(f"获取 x-statsig-id 失败，状态码: {response.status_code}", "Server")
+                return None
+        except Exception as error:
+            logger.error(f"获取 x-statsig-id 异常: {str(error)}", "Server")
+            return None
 
 class GrokApiClient:
     def __init__(self, model_id):
@@ -1221,13 +1257,28 @@ def chat_completions():
                 CONFIG["SERVER"]['COOKIE'] = CONFIG['API']['SIGNATURE_COOKIE']
             logger.info(json.dumps(request_payload,indent=2),"Server")
             try:
+                # 生成必要的请求头
+                xai_request_id = Utils.generate_xai_request_id()
+                statsig_id = Utils.get_statsig_id()
+                
+                # 构建请求头
+                request_headers = {
+                    **DEFAULT_HEADERS, 
+                    "Cookie": CONFIG["SERVER"]['COOKIE'],
+                    "x-xai-request-id": xai_request_id
+                }
+                
+                # 如果成功获取到 statsig_id 则添加到请求头
+                if statsig_id:
+                    request_headers["x-statsig-id"] = statsig_id
+                    logger.info(f"添加 x-statsig-id 到请求头", "Server")
+                else:
+                    logger.warning("无法获取 x-statsig-id，尝试不带签名发送请求", "Server")
+                
                 proxy_options = Utils.get_proxy_options()
                 response = curl_requests.post(
                     f"{CONFIG['API']['BASE_URL']}/rest/app-chat/conversations/new",
-                    headers={
-                        **DEFAULT_HEADERS, 
-                        "Cookie":CONFIG["SERVER"]['COOKIE']
-                    },
+                    headers=request_headers,
                     data=json.dumps(request_payload),
                     impersonate="chrome133a",
                     stream=True,
