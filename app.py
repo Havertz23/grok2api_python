@@ -8,11 +8,15 @@ import inspect
 import secrets
 from loguru import logger
 from pathlib import Path
+from dotenv import load_dotenv
 
 import requests
 from flask import Flask, request, Response, jsonify, stream_with_context, render_template, redirect, session
 from curl_cffi import requests as curl_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# 加载 .env 文件
+load_dotenv()
 
 class Logger:
     def __init__(self, level="INFO", colorize=True, format=None):
@@ -118,7 +122,7 @@ CONFIG = {
     },
     "RETRY": {
         "RETRYSWITCH": False,
-        "MAX_ATTEMPTS": 2
+        "MAX_ATTEMPTS": 3
     },
     "TOKEN_STATUS_FILE": str(DATA_DIR / "token_status.json"),
     "SHOW_THINKING": os.environ.get("SHOW_THINKING") == "true",
@@ -131,20 +135,24 @@ CONFIG = {
 
 DEFAULT_HEADERS = {
     'Accept': '*/*',
-    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br, zstd',
     'Content-Type': 'text/plain;charset=UTF-8',
     'Connection': 'keep-alive',
     'Origin': 'https://grok.com',
+    'Referer': 'https://grok.com/',
     'Priority': 'u=1, i',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
     'Sec-Ch-Ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
     'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"macOS"',
+    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
-    'Baggage': 'sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c'
+    'DNT': '1',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
 }
 
 class AuthTokenManager:
@@ -463,6 +471,70 @@ class AuthTokenManager:
         return self.token_status_map
 
 class Utils:
+    # 代理池配置
+    _proxy_pool = []
+    _proxy_index = 0
+    _proxy_lock = None
+
+    @staticmethod
+    def is_network_error(error):
+        """判断是否为网络连接错误，这类错误不应该移除令牌"""
+        error_str = str(error).lower()
+        network_error_keywords = [
+            'curl: (18)',  # curl数据传输过早结束
+            'curl: (6)',   # 无法解析主机
+            'curl: (7)',   # 连接失败
+            'curl: (28)',  # 操作超时
+            'curl: (35)',  # SSL连接错误
+            'curl: (52)',  # 服务器返回空回复
+            'curl: (56)',  # 接收网络数据失败
+            'connection timeout',
+            'connection reset',
+            'network unreachable',
+            'timeout',
+            'connection refused',
+            'connection aborted'
+        ]
+        return any(keyword in error_str for keyword in network_error_keywords)
+    
+    @staticmethod
+    def init_proxy_pool():
+        """初始化代理池"""
+        import threading
+        Utils._proxy_lock = threading.Lock()
+        
+        proxy_env = os.environ.get("PROXY")
+        if proxy_env:
+            if ',' in proxy_env:
+                # 多个代理，逗号分隔
+                proxies = [p.strip() for p in proxy_env.split(',') if p.strip()]
+                Utils._proxy_pool = [f"http://{proxy}" if not proxy.startswith(('http://', 'https://', 'socks5://')) else proxy for proxy in proxies]
+            else:
+                # 单个代理
+                proxy = proxy_env.strip()
+                if not proxy.startswith(('http://', 'https://', 'socks5://')):
+                    proxy = f"http://{proxy}"
+                Utils._proxy_pool = [proxy]
+        
+        logger.info(f"代理池已初始化，共 {len(Utils._proxy_pool)} 个代理", "ProxyPool")
+        for i, proxy in enumerate(Utils._proxy_pool):
+            # 只显示前20个字符，保护敏感信息
+            masked_proxy = proxy[:20] + "..." if len(proxy) > 20 else proxy
+            logger.info(f"代理 {i+1}: {masked_proxy}", "ProxyPool")
+    
+    @staticmethod
+    def get_next_proxy():
+        """获取下一个代理，实现轮换"""
+        if not Utils._proxy_pool:
+            return None
+            
+        with Utils._proxy_lock:
+            current_index = Utils._proxy_index
+            proxy = Utils._proxy_pool[current_index]
+            Utils._proxy_index = (Utils._proxy_index + 1) % len(Utils._proxy_pool)
+            logger.info(f"使用代理 {current_index + 1}/{len(Utils._proxy_pool)}: {proxy[:30]}...", "ProxyPool")
+            return proxy
+
     @staticmethod
     def organize_search_results(search_results):
         if not search_results or 'results' not in search_results:
@@ -487,23 +559,62 @@ class Utils:
 
     @staticmethod
     def get_proxy_options():
-        proxy = CONFIG["API"]["PROXY"]
+        proxy = Utils.get_next_proxy()
         proxy_options = {}
 
         if proxy:
-            logger.info(f"使用代理: {proxy}", "Server")
-            
             if proxy.startswith("socks5://"):
+                # 对于 curl_cffi，SOCKS5 代理使用 proxy 参数
                 proxy_options["proxy"] = proxy
-            
-                if '@' in proxy:
-                    auth_part = proxy.split('@')[0].split('://')[1]
-                    if ':' in auth_part:
-                        username, password = auth_part.split(':')
-                        proxy_options["proxy_auth"] = (username, password)
+                # 对于 requests 库，需要使用 proxies 参数，但 requests 不直接支持 SOCKS5
+                # 这里只设置 proxy 参数给 curl_cffi 使用
             else:
+                # HTTP/HTTPS 代理，同时支持 requests 和 curl_cffi
                 proxy_options["proxies"] = {"https": proxy, "http": proxy}     
         return proxy_options
+
+    @staticmethod
+    def get_proxy_options_for_requests():
+        """专门为 requests 库返回代理配置"""
+        proxy = Utils.get_next_proxy()
+        proxy_options = {}
+
+        if proxy and not proxy.startswith("socks5://"):
+            # requests 库只支持 HTTP/HTTPS 代理
+            proxy_options["proxies"] = {"https": proxy, "http": proxy}
+        return proxy_options
+
+    @staticmethod
+    def generate_xai_request_id():
+        """生成 x-xai-request-id UUID"""
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def get_statsig_id():
+        """从外部接口获取 x-statsig-id"""
+        try:
+            proxy_options = Utils.get_proxy_options_for_requests()
+            response = requests.get(
+                "https://rui.soundai.ee/x.php",
+                timeout=10,
+                **proxy_options
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                statsig_id = result.get("x_statsig_id", "")
+                if statsig_id:
+                    logger.info(f"成功获取 x-statsig-id: {statsig_id[:20]}...", "Server")
+                    return statsig_id
+                else:
+                    logger.error("返回的 x-statsig-id 为空", "Server")
+                    return None
+            else:
+                logger.error(f"获取 x-statsig-id 失败，状态码: {response.status_code}", "Server")
+                return None
+        except Exception as error:
+            logger.error(f"获取 x-statsig-id 异常: {str(error)}", "Server")
+            return None
 
 class GrokApiClient:
     def __init__(self, model_id):
@@ -889,10 +1000,12 @@ def handle_image_response(image_url):
             "X-API-Key": CONFIG["API"]["PICGO_KEY"]
         }
 
+        proxy_options = Utils.get_proxy_options_for_requests()
         response_url = requests.post(
             "https://www.picgo.net/api/1/upload",
             files=files,
-            headers=headers
+            headers=headers,
+            **proxy_options
         )
 
         if response_url.status_code != 200:
@@ -910,10 +1023,12 @@ def handle_image_response(image_url):
             'Authorization': f"Bearer {CONFIG['API']['TUMY_KEY']}"
         }
 
+        proxy_options = Utils.get_proxy_options_for_requests()
         response_url = requests.post(
             "https://tu.my/api/v1/upload",
             files=files,
-            headers=headers
+            headers=headers,
+            **proxy_options
         )
 
         if response_url.status_code != 200:
@@ -982,44 +1097,52 @@ def handle_stream_response(response, model):
         CONFIG["IS_IMG_GEN"] = False
         CONFIG["IS_IMG_GEN2"] = False
 
-        for chunk in stream:
-            if not chunk:
-                continue
-            try:
-                line_json = json.loads(chunk.decode("utf-8").strip())
-                print(line_json)
-                if line_json.get("error"):
-                    logger.error(json.dumps(line_json, indent=2), "Server")
-                    yield json.dumps({"error": "RateLimitError"}) + "\n\n"
-                    return
+        try:
+            for chunk in stream:
+                if not chunk:
+                    continue
+                try:
+                    line_json = json.loads(chunk.decode("utf-8").strip())
+                    print(line_json)
+                    if line_json.get("error"):
+                        logger.error(json.dumps(line_json, indent=2), "Server")
+                        yield json.dumps({"error": "RateLimitError"}) + "\n\n"
+                        return
 
-                response_data = line_json.get("result", {}).get("response")
-                if not response_data:
+                    response_data = line_json.get("result", {}).get("response")
+                    if not response_data:
+                        continue
+
+                    if response_data.get("doImgGen") or response_data.get("imageAttachmentInfo"):
+                        CONFIG["IS_IMG_GEN"] = True
+
+                    result = process_model_response(response_data, model)
+
+                    if result["token"]:
+                        yield f"data: {json.dumps(MessageProcessor.create_chat_response(result['token'], model, True))}\n\n"
+
+                    if result["imageUrl"]:
+                        CONFIG["IS_IMG_GEN2"] = True
+                        image_data = handle_image_response(result["imageUrl"])
+                        yield f"data: {json.dumps(MessageProcessor.create_chat_response(image_data, model, True))}\n\n"
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.error(f"处理流式响应行时出错: {str(e)}", "Server")
                     continue
 
-                if response_data.get("doImgGen") or response_data.get("imageAttachmentInfo"):
-                    CONFIG["IS_IMG_GEN"] = True
-
-                result = process_model_response(response_data, model)
-
-                if result["token"]:
-                    yield f"data: {json.dumps(MessageProcessor.create_chat_response(result['token'], model, True))}\n\n"
-
-                if result["imageUrl"]:
-                    CONFIG["IS_IMG_GEN2"] = True
-                    image_data = handle_image_response(result["imageUrl"])
-                    yield f"data: {json.dumps(MessageProcessor.create_chat_response(image_data, model, True))}\n\n"
-
-            except json.JSONDecodeError:
-                continue
-            except Exception as e:
-                logger.error(f"处理流式响应行时出错: {str(e)}", "Server")
-                continue
+        except Exception as stream_error:
+            logger.error(f"流式响应读取失败: {str(stream_error)}", "Server")
+            yield f"data: {json.dumps(MessageProcessor.create_chat_response('网络连接中断，请重试', model, True))}\n\n"
 
         yield "data: [DONE]\n\n"
     return generate()
 
 def initialization():
+    # 初始化代理池
+    Utils.init_proxy_pool()
+    
     sso_array = os.environ.get("SSO", "").split(',')
     logger.info("开始加载令牌", "Server")
     token_manager.load_token_status()
@@ -1030,9 +1153,6 @@ def initialization():
 
     logger.info(f"成功加载令牌: {json.dumps(token_manager.get_all_tokens(), indent=2)}", "Server")
     logger.info(f"令牌加载完成，共加载: {len(token_manager.get_all_tokens())}个令牌", "Server")
-
-    if CONFIG["API"]["PROXY"]:
-        logger.info(f"代理已设置: {CONFIG['API']['PROXY']}", "Server")
 
 logger.info("初始化完成", "Server")
 
@@ -1199,13 +1319,23 @@ def chat_completions():
         stream = data.get("stream", False)
 
         retry_count = 0
+        is_network_error_retry = False
         grok_client = GrokApiClient(model)
         request_payload = grok_client.prepare_chat_request(data)
         logger.info(json.dumps(request_payload,indent=2))
 
         while retry_count < CONFIG["RETRY"]["MAX_ATTEMPTS"]:
             retry_count += 1
-            CONFIG["API"]["SIGNATURE_COOKIE"] = Utils.create_auth_headers(model)
+            
+            # 如果是网络错误重试，先恢复之前减少的计数，然后获取当前令牌
+            if is_network_error_retry:
+                # 重置标记
+                is_network_error_retry = False
+                # 获取当前令牌而不增加计数
+                CONFIG["API"]["SIGNATURE_COOKIE"] = Utils.create_auth_headers(model, True)
+            else:
+                # 正常获取下一个令牌并增加计数
+                CONFIG["API"]["SIGNATURE_COOKIE"] = Utils.create_auth_headers(model)
 
             if not CONFIG["API"]["SIGNATURE_COOKIE"]:
                 raise ValueError('该模型无可用令牌')
@@ -1221,16 +1351,36 @@ def chat_completions():
                 CONFIG["SERVER"]['COOKIE'] = CONFIG['API']['SIGNATURE_COOKIE']
             logger.info(json.dumps(request_payload,indent=2),"Server")
             try:
+                # 添加请求间延迟，避免被检测
+                time.sleep(1)
+                
+                # 生成必要的请求头
+                xai_request_id = Utils.generate_xai_request_id()
+                statsig_id = Utils.get_statsig_id()
+                
+                # 构建请求头
+                request_headers = {
+                    **DEFAULT_HEADERS, 
+                    "Cookie": CONFIG["SERVER"]['COOKIE'],
+                    "x-xai-request-id": xai_request_id
+                }
+                
+                # 如果成功获取到 statsig_id 则添加到请求头
+                if statsig_id:
+                    request_headers["x-statsig-id"] = statsig_id
+                    logger.info(f"添加 x-statsig-id 到请求头", "Server")
+                else:
+                    logger.warning("无法获取 x-statsig-id，尝试不带签名发送请求", "Server")
+                
                 proxy_options = Utils.get_proxy_options()
                 response = curl_requests.post(
                     f"{CONFIG['API']['BASE_URL']}/rest/app-chat/conversations/new",
-                    headers={
-                        **DEFAULT_HEADERS, 
-                        "Cookie":CONFIG["SERVER"]['COOKIE']
-                    },
+                    headers=request_headers,
                     data=json.dumps(request_payload),
                     impersonate="chrome133a",
                     stream=True,
+                    timeout=30,
+                    verify=True,
                     **proxy_options)
                 logger.info(CONFIG["SERVER"]['COOKIE'],"Server")
                 if response.status_code == 200:
@@ -1251,9 +1401,22 @@ def chat_completions():
                         logger.error(str(error), "Server")
                         if CONFIG["API"]["IS_CUSTOM_SSO"]:
                             raise ValueError(f"自定义SSO令牌当前模型{model}的请求次数已失效")
-                        token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
-                        if token_manager.get_token_count_for_model(model) == 0:
-                            raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
+                        
+                        # 如果是网络连接错误，减少请求计数但不移除令牌
+                        if Utils.is_network_error(error):
+                            logger.info(f"响应处理时检测到网络连接错误，减少请求计数但保留令牌: {str(error)}", "Server")
+                            token_manager.reduce_token_request_count(model, 1)
+                            is_network_error_retry = True  # 标记为网络错误重试
+                            # 网络错误时继续重试，不抛出异常
+                            if token_manager.get_token_count_for_model(model) == 0:
+                                raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
+                            continue  # 继续重试循环
+                        else:
+                            # 其他错误则移除令牌
+                            logger.info(f"响应处理时检测到非网络错误，移除令牌: {str(error)}", "Server")
+                            token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
+                            if token_manager.get_token_count_for_model(model) == 0:
+                                raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
                 elif response.status_code == 403:
                     response_status_code = 403
                     token_manager.reduce_token_request_count(model,1)#重置去除当前因为错误未成功请求的次数，确保不会因为错误未成功请求的次数导致次数上限
@@ -1288,11 +1451,28 @@ def chat_completions():
                 logger.error(f"请求处理异常: {str(e)}", "Server")
                 if CONFIG["API"]["IS_CUSTOM_SSO"]:
                     raise
+                
+                # 如果是网络连接错误，减少请求计数但不移除令牌
+                if Utils.is_network_error(e):
+                    logger.info(f"检测到网络连接错误，减少请求计数但保留令牌: {str(e)}", "Server")
+                    token_manager.reduce_token_request_count(model, 1)
+                    is_network_error_retry = True  # 标记为网络错误重试
+                else:
+                    # 其他错误则移除令牌
+                    logger.info(f"检测到非网络错误，移除令牌: {str(e)}", "Server")
+                    token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
+                
+                # 检查是否还有可用令牌
+                if token_manager.get_token_count_for_model(model) == 0:
+                    raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
+                
                 continue
         if response_status_code == 403:
             raise ValueError('IP暂时被封无法破盾，请稍后重试或者更换ip')
         elif response_status_code == 500:
-            raise ValueError('当前模型所有令牌暂无可用，请稍后重试')    
+            raise ValueError('当前模型所有令牌暂无可用，请稍后重试')
+        else:
+            raise ValueError('请求失败，请检查网络连接或稍后重试')
 
     except Exception as error:
         logger.error(str(error), "ChatAPI")
