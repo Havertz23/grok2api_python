@@ -261,6 +261,17 @@
                         <span class="overview-value" id="grok-3-reasoning-count">0</span>
                     </div>
                 </div>
+                <div class="overview-card" data-tooltip="grok-4 模型剩余可用次数（需要SSO_PRO令牌）">
+                    <div class="overview-icon">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                        </svg>
+                    </div>
+                    <div class="overview-content">
+                        <span class="overview-label">grok-4</span>
+                        <span class="overview-value" id="grok-4-count">0</span>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -296,6 +307,7 @@
                             <option value="grok-3" selected>grok-3</option>
                             <option value="grok-3-reasoning">grok-3-reasoning</option>
                             <option value="grok-3-deepsearch">grok-3-deepsearch</option>
+                            <option value="grok-4">grok-4</option>
                         </select>
                         <button class="btn btn-base" id="testAvailabilityBtn" aria-label="检测模型可用性">检测</button>
                     </div>
@@ -345,7 +357,8 @@
             "grok-3": { RequestFrequency: 20, ExpirationTime: 7200000 },
             "grok-3-deepsearch": { RequestFrequency: 10, ExpirationTime: 86400000 },
             "grok-3-deepersearch": { RequestFrequency: 3, ExpirationTime: 86400000 },
-            "grok-3-reasoning": { RequestFrequency: 10, ExpirationTime: 86400000 }
+            "grok-3-reasoning": { RequestFrequency: 10, ExpirationTime: 86400000 },
+            "grok-4": { RequestFrequency: 20, ExpirationTime: 7200000 }
         };
 
         let tokenMap = {};
@@ -368,7 +381,7 @@
                 modelRemaining[modelName] = 0;
                 Object.values(tokenMap).forEach(tokenData => {
                     const modelData = tokenData[modelName];
-                    if (modelData.isValid) {
+                    if (modelData && modelData.isValid) {
                         modelRemaining[modelName] += maxRequests - modelData.totalRequestCount;
                     }
                 });
@@ -385,7 +398,7 @@
             }
 
             const modelRemaining = calculateModelRemaining();
-            const modelIds = ['grok-2', 'grok-3', 'grok-3-deepsearch', 'grok-3-deepersearch', 'grok-3-reasoning'];
+            const modelIds = ['grok-2', 'grok-3', 'grok-3-deepsearch', 'grok-3-deepersearch', 'grok-3-reasoning', 'grok-4'];
             modelIds.forEach(modelName => {
                 const countElement = document.getElementById(`${modelName}-count`);
                 if (countElement) {
@@ -403,7 +416,7 @@
             let shouldRefresh = false;
             Object.values(tokenMap).forEach(tokenData => {
                 Object.entries(tokenData).forEach(([modelName, modelData]) => {
-                    if (!modelData.isValid) {
+                    if (modelConfig[modelName] && !modelData.isValid) {
                         const recoveryTime = modelData.invalidatedTime + modelConfig[modelName].ExpirationTime;
                         if (recoveryTime <= currentTime) {
                             shouldRefresh = true;
@@ -517,6 +530,28 @@
                 progressFill.className = 'progress-fill';
 
                 const modelData = tokenData[modelName];
+                if (!modelData) {
+                    // 如果没有该模型的数据，显示不可用状态
+                    progressFill.style.width = '0%';
+                    progressFill.style.backgroundColor = '#94A3B8';
+                    
+                    const progressText = document.createElement('div');
+                    progressText.className = 'progress-text';
+                    progressText.textContent = '0/0';
+
+                    const status = document.createElement('div');
+                    status.className = 'status status-expired';
+                    status.textContent = '不可用';
+
+                    progressContainer.appendChild(progressBar);
+                    progressContainer.appendChild(progressText);
+                    modelItem.appendChild(modelNameSpan);
+                    modelItem.appendChild(progressContainer);
+                    modelItem.appendChild(status);
+                    modelList.appendChild(modelItem);
+                    return;
+                }
+                
                 const requestCount = modelData.totalRequestCount;
                 const maxRequests = config.RequestFrequency;
                 const percentage = Math.min((requestCount / maxRequests) * 100, 100);
@@ -566,6 +601,24 @@
             Object.entries(modelConfig).forEach(([modelName, config]) => {
                 const modelItem = modelItems[index++];
                 const modelData = tokenData[modelName];
+                
+                if (!modelData) {
+                    // 如果没有该模型的数据，显示不可用状态
+                    const progressFill = modelItem.querySelector('.progress-fill');
+                    progressFill.style.width = '0%';
+                    progressFill.style.backgroundColor = '#94A3B8';
+
+                    const progressText = modelItem.querySelector('.progress-text');
+                    progressText.textContent = '0/0';
+
+                    const status = modelItem.querySelector('.status');
+                    status.className = 'status status-expired';
+                    status.textContent = '不可用';
+                    const tooltip = status.querySelector('.tooltip');
+                    if (tooltip) tooltip.remove();
+                    return;
+                }
+                
                 const requestCount = modelData.totalRequestCount;
                 const maxRequests = config.RequestFrequency;
                 const percentage = Math.min((requestCount / maxRequests) * 100, 100);
@@ -647,8 +700,8 @@
             const statusFilterValue = statusFilter.value;
 
             return tokenEntries.filter(([token, tokenData]) => {
-                const hasActive = Object.values(tokenData).some(data => data.isValid);
-                const hasExpired = Object.values(tokenData).some(data => !data.isValid);
+                const hasActive = Object.values(tokenData).some(data => data && data.isValid);
+                const hasExpired = Object.values(tokenData).some(data => data && !data.isValid);
 
                 let display = true;
                 if (!token.toLowerCase().includes(searchTerm)) display = false;
