@@ -98,7 +98,8 @@ CONFIG = {
         "grok-3-imageGen": "grok-3",
         "grok-3-deepsearch": "grok-3",
         "grok-3-deepersearch": "grok-3",
-        "grok-3-reasoning": "grok-3"
+        "grok-3-reasoning": "grok-3",
+        "grok-4": "grok-4"
     },
     "API": {
         "IS_TEMP_CONVERSATION": os.environ.get("IS_TEMP_CONVERSATION", "true").lower() == "true",
@@ -160,6 +161,7 @@ class AuthTokenManager:
         self.token_model_map = {}
         self.expired_tokens = set()
         self.token_status_map = {}
+        self.pro_token_model_map = {}  # 专门用于grok-4的SSO_PRO令牌
 
         self.model_config = {
             "grok-2": {
@@ -181,6 +183,10 @@ class AuthTokenManager:
             "grok-3-reasoning": {
                 "RequestFrequency": 10,
                 "ExpirationTime": 24 * 60 * 60 * 1000  # 24小时
+            },
+            "grok-4": {
+                "RequestFrequency": 20,
+                "ExpirationTime": 2 * 60 * 60 * 1000  # 2小时
             }
         }
         self.token_reset_switch = False
@@ -230,6 +236,35 @@ class AuthTokenManager:
         if not isinitialization:
             self.save_token_status()
 
+    def add_pro_token(self, token, isinitialization=False):
+        """专门处理SSO_PRO令牌，仅用于grok-4模型"""
+        sso = token.split("sso=")[1].split(";")[0]
+        model = "grok-4"
+        
+        if model not in self.pro_token_model_map:
+            self.pro_token_model_map[model] = []
+        if sso not in self.token_status_map:
+            self.token_status_map[sso] = {}
+
+        existing_token_entry = next((entry for entry in self.pro_token_model_map[model] if entry["token"] == token), None)
+
+        if not existing_token_entry:
+            self.pro_token_model_map[model].append({
+                "token": token,
+                "RequestCount": 0,
+                "AddedTime": int(time.time() * 1000),
+                "StartCallTime": None
+            })
+
+            if model not in self.token_status_map[sso]:
+                self.token_status_map[sso][model] = {
+                    "isValid": True,
+                    "invalidatedTime": None,
+                    "totalRequestCount": 0
+                }
+        if not isinitialization:
+            self.save_token_status()
+
     def set_token(self, token):
         models = list(self.model_config.keys())
         self.token_model_map = {model: [{
@@ -266,15 +301,27 @@ class AuthTokenManager:
         try:
             normalized_model = self.normalize_model_name(model_id)
             
-            if normalized_model not in self.token_model_map:
-                logger.error(f"模型 {normalized_model} 不存在", "TokenManager")
-                return False
-                
-            if not self.token_model_map[normalized_model]:
-                logger.error(f"模型 {normalized_model} 没有可用的token", "TokenManager")
-                return False
-                
-            token_entry = self.token_model_map[normalized_model][0]
+            # grok-4 使用专门的SSO_PRO令牌
+            if normalized_model == "grok-4":
+                if normalized_model not in self.pro_token_model_map:
+                    logger.error(f"模型 {normalized_model} 不存在于Pro令牌映射中", "TokenManager")
+                    return False
+                    
+                if not self.pro_token_model_map[normalized_model]:
+                    logger.error(f"模型 {normalized_model} 没有可用的Pro token", "TokenManager")
+                    return False
+                    
+                token_entry = self.pro_token_model_map[normalized_model][0]
+            else:
+                if normalized_model not in self.token_model_map:
+                    logger.error(f"模型 {normalized_model} 不存在", "TokenManager")
+                    return False
+                    
+                if not self.token_model_map[normalized_model]:
+                    logger.error(f"模型 {normalized_model} 没有可用的token", "TokenManager")
+                    return False
+                    
+                token_entry = self.token_model_map[normalized_model][0]
             
             # 确保RequestCount不会小于0
             new_count = max(0, token_entry["RequestCount"] - count)
@@ -298,38 +345,74 @@ class AuthTokenManager:
     def get_next_token_for_model(self, model_id, is_return=False):
         normalized_model = self.normalize_model_name(model_id)
 
-        if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
-            return None
+        # grok-4 使用专门的SSO_PRO令牌
+        if normalized_model == "grok-4":
+            if normalized_model not in self.pro_token_model_map or not self.pro_token_model_map[normalized_model]:
+                return None
+            
+            token_entry = self.pro_token_model_map[normalized_model][0]
+            if is_return:
+                return token_entry["token"]
 
-        token_entry = self.token_model_map[normalized_model][0]
-        if is_return:
-            return token_entry["token"]
+            if token_entry:
+                if token_entry["StartCallTime"] is None:
+                    token_entry["StartCallTime"] = int(time.time() * 1000)
 
-        if token_entry:
-            if token_entry["StartCallTime"] is None:
-                token_entry["StartCallTime"] = int(time.time() * 1000)
+                if not self.token_reset_switch:
+                    self.start_token_reset_process()
+                    self.token_reset_switch = True
 
-            if not self.token_reset_switch:
-                self.start_token_reset_process()
-                self.token_reset_switch = True
+                token_entry["RequestCount"] += 1
 
-            token_entry["RequestCount"] += 1
+                if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
+                    self.remove_pro_token_from_model(normalized_model, token_entry["token"])
+                    next_token_entry = self.pro_token_model_map[normalized_model][0] if self.pro_token_model_map[normalized_model] else None
+                    return next_token_entry["token"] if next_token_entry else None
 
-            if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
-                self.remove_token_from_model(normalized_model, token_entry["token"])
-                next_token_entry = self.token_model_map[normalized_model][0] if self.token_model_map[normalized_model] else None
-                return next_token_entry["token"] if next_token_entry else None
+                sso = token_entry["token"].split("sso=")[1].split(";")[0]
+                if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                    if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
+                        self.token_status_map[sso][normalized_model]["isValid"] = False
+                        self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
+                    self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
 
-            sso = token_entry["token"].split("sso=")[1].split(";")[0]
-            if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
-                if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
-                    self.token_status_map[sso][normalized_model]["isValid"] = False
-                    self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
-                self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
+                    self.save_token_status()
 
-                self.save_token_status()
+                return token_entry["token"]
+        else:
+            # 其他模型使用普通的SSO令牌
+            if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
+                return None
 
-            return token_entry["token"]
+            token_entry = self.token_model_map[normalized_model][0]
+            if is_return:
+                return token_entry["token"]
+
+            if token_entry:
+                if token_entry["StartCallTime"] is None:
+                    token_entry["StartCallTime"] = int(time.time() * 1000)
+
+                if not self.token_reset_switch:
+                    self.start_token_reset_process()
+                    self.token_reset_switch = True
+
+                token_entry["RequestCount"] += 1
+
+                if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
+                    self.remove_token_from_model(normalized_model, token_entry["token"])
+                    next_token_entry = self.token_model_map[normalized_model][0] if self.token_model_map[normalized_model] else None
+                    return next_token_entry["token"] if next_token_entry else None
+
+                sso = token_entry["token"].split("sso=")[1].split(";")[0]
+                if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                    if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
+                        self.token_status_map[sso][normalized_model]["isValid"] = False
+                        self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
+                    self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
+
+                    self.save_token_status()
+
+                return token_entry["token"]
 
         return None
 
@@ -361,6 +444,35 @@ class AuthTokenManager:
         logger.error(f"在模型 {normalized_model} 中未找到 token: {token}", "TokenManager")
         return False
 
+    def remove_pro_token_from_model(self, model_id, token):
+        """专门用于移除grok-4的SSO_PRO令牌"""
+        normalized_model = self.normalize_model_name(model_id)
+
+        if normalized_model not in self.pro_token_model_map:
+            logger.error(f"模型 {normalized_model} 不存在于Pro令牌映射中", "TokenManager")
+            return False
+
+        model_tokens = self.pro_token_model_map[normalized_model]
+        token_index = next((i for i, entry in enumerate(model_tokens) if entry["token"] == token), -1)
+
+        if token_index != -1:
+            removed_token_entry = model_tokens.pop(token_index)
+            self.expired_tokens.add((
+                removed_token_entry["token"],
+                normalized_model,
+                int(time.time() * 1000)
+            ))
+
+            if not self.token_reset_switch:
+                self.start_token_reset_process()
+                self.token_reset_switch = True
+
+            logger.info(f"模型{model_id}的Pro令牌已失效，已成功移除令牌: {token}", "TokenManager")
+            return True
+
+        logger.error(f"在模型 {normalized_model} 的Pro令牌映射中未找到 token: {token}", "TokenManager")
+        return False
+
     def get_expired_tokens(self):
         return list(self.expired_tokens)
 
@@ -371,13 +483,20 @@ class AuthTokenManager:
 
     def get_token_count_for_model(self, model_id):
         normalized_model = self.normalize_model_name(model_id)
-        return len(self.token_model_map.get(normalized_model, []))
+        if normalized_model == "grok-4":
+            return len(self.pro_token_model_map.get(normalized_model, []))
+        else:
+            return len(self.token_model_map.get(normalized_model, []))
 
     def get_remaining_token_request_capacity(self):
         remaining_capacity_map = {}
 
         for model in self.model_config.keys():
-            model_tokens = self.token_model_map.get(model, [])
+            if model == "grok-4":
+                model_tokens = self.pro_token_model_map.get(model, [])
+            else:
+                model_tokens = self.token_model_map.get(model, [])
+            
             model_request_frequency = self.model_config[model]["RequestFrequency"]
 
             total_used_requests = sum(token_entry.get("RequestCount", 0) for token_entry in model_tokens)
@@ -389,7 +508,10 @@ class AuthTokenManager:
 
     def get_token_array_for_model(self, model_id):
         normalized_model = self.normalize_model_name(model_id)
-        return self.token_model_map.get(normalized_model, [])
+        if normalized_model == "grok-4":
+            return self.pro_token_model_map.get(normalized_model, [])
+        else:
+            return self.token_model_map.get(normalized_model, [])
 
     def start_token_reset_process(self):
         def reset_expired_tokens():
@@ -461,14 +583,27 @@ class AuthTokenManager:
     def get_current_token(self, model_id):
         normalized_model = self.normalize_model_name(model_id)
 
-        if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
-            return None
+        if normalized_model == "grok-4":
+            if normalized_model not in self.pro_token_model_map or not self.pro_token_model_map[normalized_model]:
+                return None
+            token_entry = self.pro_token_model_map[normalized_model][0]
+        else:
+            if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
+                return None
+            token_entry = self.token_model_map[normalized_model][0]
 
-        token_entry = self.token_model_map[normalized_model][0]
         return token_entry["token"]
 
     def get_token_status_map(self):
         return self.token_status_map
+
+    def remove_token_for_model(self, model_id, token):
+        """通用的令牌移除方法，根据模型类型选择合适的移除方式"""
+        normalized_model = self.normalize_model_name(model_id)
+        if normalized_model == "grok-4":
+            return self.remove_pro_token_from_model(model_id, token)
+        else:
+            return self.remove_token_from_model(model_id, token)
 
 class Utils:
     # 代理池配置
@@ -1144,11 +1279,18 @@ def initialization():
     Utils.init_proxy_pool()
     
     sso_array = os.environ.get("SSO", "").split(',')
+    sso_pro_array = os.environ.get("SSO_PRO", "").split(',')
     logger.info("开始加载令牌", "Server")
     token_manager.load_token_status()
     for sso in sso_array:
         if sso:
             token_manager.add_token(f"sso-rw={sso};sso={sso}",True)
+    
+    # 加载SSO_PRO令牌（仅用于grok-4）
+    logger.info("开始加载SSO_PRO令牌", "Server")
+    for sso_pro in sso_pro_array:
+        if sso_pro:
+            token_manager.add_pro_token(f"sso-rw={sso_pro};sso={sso_pro}",True)
     token_manager.save_token_status()
 
     logger.info(f"成功加载令牌: {json.dumps(token_manager.get_all_tokens(), indent=2)}", "Server")
@@ -1414,7 +1556,7 @@ def chat_completions():
                         else:
                             # 其他错误则移除令牌
                             logger.info(f"响应处理时检测到非网络错误，移除令牌: {str(error)}", "Server")
-                            token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
+                            token_manager.remove_token_for_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
                             if token_manager.get_token_count_for_model(model) == 0:
                                 raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
                 elif response.status_code == 403:
@@ -1432,7 +1574,7 @@ def chat_completions():
                     if CONFIG["API"]["IS_CUSTOM_SSO"]:
                         raise ValueError(f"自定义SSO令牌当前模型{model}的请求次数已失效")
 
-                    token_manager.remove_token_from_model(
+                    token_manager.remove_token_for_model(
                         model, CONFIG["API"]["SIGNATURE_COOKIE"])
                     if token_manager.get_token_count_for_model(model) == 0:
                         raise ValueError(f"{model} 次数已达上限，请切换其他模型或者重新对话")
@@ -1442,7 +1584,7 @@ def chat_completions():
                         raise ValueError(f"自定义SSO令牌当前模型{model}的请求次数已失效")
 
                     logger.error(f"令牌异常错误状态!status: {response.status_code}","Server")
-                    token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
+                    token_manager.remove_token_for_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
                     logger.info(
                         f"当前{model}剩余可用令牌数: {token_manager.get_token_count_for_model(model)}",
                         "Server")
@@ -1460,7 +1602,7 @@ def chat_completions():
                 else:
                     # 其他错误则移除令牌
                     logger.info(f"检测到非网络错误，移除令牌: {str(e)}", "Server")
-                    token_manager.remove_token_from_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
+                    token_manager.remove_token_for_model(model, CONFIG["API"]["SIGNATURE_COOKIE"])
                 
                 # 检查是否还有可用令牌
                 if token_manager.get_token_count_for_model(model) == 0:
