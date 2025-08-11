@@ -284,7 +284,7 @@
                         <span class="overview-value" id="grok-4-free-count">0</span>
                     </div>
                 </div>
-                <div class="overview-card" data-tooltip="今日 grok-4-free 使用情况">
+                <div class="overview-card" data-tooltip="今日 grok-4 免费版使用情况（令牌数量×10次/天）">
                     <div class="overview-icon">
                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="10"/>
@@ -293,7 +293,7 @@
                     </div>
                     <div class="overview-content">
                         <span class="overview-label">今日已用/限制</span>
-                        <span class="overview-value" id="daily-usage-count">0/10</span>
+                        <span class="overview-value" id="daily-usage-count">0/0</span>
                     </div>
                 </div>
             </div>
@@ -416,7 +416,7 @@
                         }
                     });
                     // 返回两者的最小值
-                    modelRemaining[modelName] = Math.min(tokenRemaining, dailyRemaining);
+                    modelRemaining[modelName] = Math.max(0, Math.min(tokenRemaining, dailyRemaining));
                 } else {
                     Object.values(tokenMap).forEach(tokenData => {
                         const modelData = tokenData[modelName];
@@ -454,7 +454,14 @@
                 if (dailyUsageElement) {
                     const used = window.dailyUsageInfo.grok4Free.used;
                     const limit = window.dailyUsageInfo.grok4Free.limit;
+                    const tokenCount = window.dailyUsageInfo.grok4Free.tokenCount;
                     dailyUsageElement.textContent = `${used}/${limit}`;
+                    
+                    // 更新工具提示显示令牌数量信息
+                    const dailyCard = dailyUsageElement.closest('.overview-card');
+                    if (dailyCard && tokenCount > 0) {
+                        dailyCard.setAttribute('data-tooltip', `今日 grok-4 免费版使用情况（${tokenCount} 个令牌 × 10次/天 = ${limit}次总限制）`);
+                    }
                 }
             }
         }

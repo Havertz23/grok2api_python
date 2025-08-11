@@ -258,15 +258,18 @@ class AuthTokenManager:
         if today not in self.free_grok4_usage:
             self.free_grok4_usage[today] = {}
             
+        # 计算每日总限制 = 令牌数量 × 每个令牌10次
+        token_count = len(self.token_model_map.get(model_id, []))
+        daily_limit = token_count * 10
+        
         # 获取今日总使用次数
         today_usage = sum(self.free_grok4_usage[today].values())
-        daily_limit = 10  # 每日10次免费使用
         
         if today_usage >= daily_limit:
             logger.warning(f"今日grok-4-free使用次数已达上限: {today_usage}/{daily_limit}", "TokenManager")
             return False
             
-        # 更新使用记录（这里记录全局使用次数，也可以按token记录）
+        # 更新使用记录（使用全局计数）
         global_key = "global"
         if global_key not in self.free_grok4_usage[today]:
             self.free_grok4_usage[today][global_key] = 0
@@ -640,7 +643,9 @@ class AuthTokenManager:
                 model_tokens = self.token_model_map.get(model, [])
                 today = self.get_today_key()
                 today_usage = sum(self.free_grok4_usage.get(today, {}).values())
-                daily_limit = 10
+                
+                # 每日限制 = 令牌数量 × 每个令牌10次
+                daily_limit = len(model_tokens) * 10
                 daily_remaining = max(0, daily_limit - today_usage)
                 
                 model_request_frequency = self.model_config[model]["RequestFrequency"]
@@ -1499,14 +1504,19 @@ def get_manager_tokens():
     daily_usage = token_manager.free_grok4_usage.get(today, {})
     today_usage = sum(daily_usage.values())
     
+    # 计算每日限制：令牌数量 × 每个令牌10次
+    grok4_free_token_count = len(token_manager.token_model_map.get("grok-4-free", []))
+    daily_limit = grok4_free_token_count * 10
+    
     result = {
         "tokens": token_status,
         "dailyUsage": {
             "today": today,
             "grok4Free": {
                 "used": today_usage,
-                "limit": 10,
-                "remaining": max(0, 10 - today_usage)
+                "limit": daily_limit,
+                "remaining": max(0, daily_limit - today_usage),
+                "tokenCount": grok4_free_token_count
             }
         }
     }
