@@ -261,15 +261,39 @@
                         <span class="overview-value" id="grok-3-reasoning-count">0</span>
                     </div>
                 </div>
-                <div class="overview-card" data-tooltip="grok-4 模型剩余可用次数（需要SSO_PRO令牌）">
+                <div class="overview-card" data-tooltip="grok-4 专业版模型剩余可用次数（需要SSO_PRO令牌）">
                     <div class="overview-icon">
                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
                         </svg>
                     </div>
                     <div class="overview-content">
-                        <span class="overview-label">grok-4</span>
+                        <span class="overview-label">grok-4 Pro</span>
                         <span class="overview-value" id="grok-4-count">0</span>
+                    </div>
+                </div>
+                <div class="overview-card" data-tooltip="grok-4 免费版模型剩余可用次数（每日10次限制，使用普通SSO令牌）">
+                    <div class="overview-icon">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                            <circle cx="18" cy="6" r="3"/>
+                        </svg>
+                    </div>
+                    <div class="overview-content">
+                        <span class="overview-label">grok-4 Free</span>
+                        <span class="overview-value" id="grok-4-free-count">0</span>
+                    </div>
+                </div>
+                <div class="overview-card" data-tooltip="今日 grok-4-free 使用情况">
+                    <div class="overview-icon">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <polyline points="12,6 12,12 16,14"/>
+                        </svg>
+                    </div>
+                    <div class="overview-content">
+                        <span class="overview-label">今日已用/限制</span>
+                        <span class="overview-value" id="daily-usage-count">0/10</span>
                     </div>
                 </div>
             </div>
@@ -358,7 +382,8 @@
             "grok-3-deepsearch": { RequestFrequency: 10, ExpirationTime: 86400000 },
             "grok-3-deepersearch": { RequestFrequency: 3, ExpirationTime: 86400000 },
             "grok-3-reasoning": { RequestFrequency: 10, ExpirationTime: 86400000 },
-            "grok-4": { RequestFrequency: 20, ExpirationTime: 7200000 }
+            "grok-4": { RequestFrequency: 20, ExpirationTime: 7200000 },
+            "grok-4-free": { RequestFrequency: 10, ExpirationTime: 86400000 }
         };
 
         let tokenMap = {};
@@ -379,12 +404,27 @@
             Object.keys(modelConfig).forEach(modelName => {
                 const maxRequests = modelConfig[modelName].RequestFrequency;
                 modelRemaining[modelName] = 0;
-                Object.values(tokenMap).forEach(tokenData => {
-                    const modelData = tokenData[modelName];
-                    if (modelData && modelData.isValid) {
-                        modelRemaining[modelName] += maxRequests - modelData.totalRequestCount;
-                    }
-                });
+                
+                // 对于 grok-4-free，需要特殊处理每日限制
+                if (modelName === 'grok-4-free' && window.dailyUsageInfo) {
+                    const dailyRemaining = window.dailyUsageInfo.grok4Free.remaining;
+                    let tokenRemaining = 0;
+                    Object.values(tokenMap).forEach(tokenData => {
+                        const modelData = tokenData[modelName];
+                        if (modelData && modelData.isValid) {
+                            tokenRemaining += maxRequests - modelData.totalRequestCount;
+                        }
+                    });
+                    // 返回两者的最小值
+                    modelRemaining[modelName] = Math.min(tokenRemaining, dailyRemaining);
+                } else {
+                    Object.values(tokenMap).forEach(tokenData => {
+                        const modelData = tokenData[modelName];
+                        if (modelData && modelData.isValid) {
+                            modelRemaining[modelName] += maxRequests - modelData.totalRequestCount;
+                        }
+                    });
+                }
             });
             return modelRemaining;
         }
@@ -398,7 +438,7 @@
             }
 
             const modelRemaining = calculateModelRemaining();
-            const modelIds = ['grok-2', 'grok-3', 'grok-3-deepsearch', 'grok-3-deepersearch', 'grok-3-reasoning', 'grok-4'];
+            const modelIds = ['grok-2', 'grok-3', 'grok-3-deepsearch', 'grok-3-deepersearch', 'grok-3-reasoning', 'grok-4', 'grok-4-free'];
             modelIds.forEach(modelName => {
                 const countElement = document.getElementById(`${modelName}-count`);
                 if (countElement) {
@@ -407,6 +447,16 @@
                     console.warn(`Element with ID "${modelName}-count" not found.`);
                 }
             });
+            
+            // 更新每日使用情况
+            if (window.dailyUsageInfo) {
+                const dailyUsageElement = document.getElementById('daily-usage-count');
+                if (dailyUsageElement) {
+                    const used = window.dailyUsageInfo.grok4Free.used;
+                    const limit = window.dailyUsageInfo.grok4Free.limit;
+                    dailyUsageElement.textContent = `${used}/${limit}`;
+                }
+            }
         }
 
         async function updateExpiredTokenTimers() {
@@ -749,10 +799,20 @@
                 }
                 const data = await response.json();
                 console.log('获取到的数据:', data);
-                if (!data || typeof data !== 'object') {
+                
+                // 处理新的数据格式
+                if (data.tokens) {
+                    tokenMap = data.tokens;
+                    window.dailyUsageInfo = data.dailyUsage;
+                } else {
+                    // 兼容旧格式
+                    tokenMap = data;
+                }
+                
+                if (!tokenMap || typeof tokenMap !== 'object') {
                     throw new Error('返回的数据不是有效的 Token Map');
                 }
-                tokenMap = data;
+                
                 renderTokenDiff(tokenMap);
                 console.log('tokenMap 更新成功');
             } catch (error) {

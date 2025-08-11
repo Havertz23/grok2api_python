@@ -99,7 +99,8 @@ CONFIG = {
         "grok-3-deepsearch": "grok-3",
         "grok-3-deepersearch": "grok-3",
         "grok-3-reasoning": "grok-3",
-        "grok-4": "grok-4"
+        "grok-4": "grok-4",
+        "grok-4-free": "grok-4"
     },
     "API": {
         "IS_TEMP_CONVERSATION": os.environ.get("IS_TEMP_CONVERSATION", "true").lower() == "true",
@@ -162,6 +163,8 @@ class AuthTokenManager:
         self.expired_tokens = set()
         self.token_status_map = {}
         self.pro_token_model_map = {}  # 专门用于grok-4的SSO_PRO令牌
+        self.free_grok4_usage = {}  # 记录普通账号grok-4-free的每日使用情况
+        self.load_daily_usage()  # 加载每日使用记录
 
         self.model_config = {
             "grok-2": {
@@ -187,6 +190,10 @@ class AuthTokenManager:
             "grok-4": {
                 "RequestFrequency": 20,
                 "ExpirationTime": 2 * 60 * 60 * 1000  # 2小时
+            },
+            "grok-4-free": {
+                "RequestFrequency": 10,
+                "ExpirationTime": 24 * 60 * 60 * 1000  # 24小时
             }
         }
         self.token_reset_switch = False
@@ -209,9 +216,93 @@ class AuthTokenManager:
                 logger.info("已从配置文件加载令牌状态", "TokenManager")
         except Exception as error:
             logger.error(f"加载令牌状态失败: {str(error)}", "TokenManager")
+            
+    def load_daily_usage(self):
+        """加载每日使用记录"""
+        try:
+            daily_usage_file = Path(DATA_DIR / "daily_usage.json")
+            if daily_usage_file.exists():
+                with open(daily_usage_file, 'r', encoding='utf-8') as f:
+                    self.free_grok4_usage = json.load(f)
+                logger.info("已从配置文件加载每日使用记录", "TokenManager")
+        except Exception as error:
+            logger.error(f"加载每日使用记录失败: {str(error)}", "TokenManager")
+            
+    def save_daily_usage(self):
+        """保存每日使用记录"""
+        try:
+            daily_usage_file = Path(DATA_DIR / "daily_usage.json")
+            with open(daily_usage_file, 'w', encoding='utf-8') as f:
+                json.dump(self.free_grok4_usage, f, indent=2, ensure_ascii=False)
+            logger.debug("每日使用记录已保存", "TokenManager")
+        except Exception as error:
+            logger.error(f"保存每日使用记录失败: {str(error)}", "TokenManager")
+            
+    def get_today_key(self):
+        """获取今日日期键"""
+        import datetime
+        return datetime.datetime.now().strftime("%Y-%m-%d")
+        
+    def check_and_update_daily_usage(self, model_id, is_return=False):
+        """检查并更新每日使用次数"""
+        if model_id != "grok-4-free":
+            return True
+            
+        today = self.get_today_key()
+        
+        # 如果只是返回token而不实际使用，跳过检查
+        if is_return:
+            return True
+            
+        # 初始化今日记录
+        if today not in self.free_grok4_usage:
+            self.free_grok4_usage[today] = {}
+            
+        # 获取今日总使用次数
+        today_usage = sum(self.free_grok4_usage[today].values())
+        daily_limit = 10  # 每日10次免费使用
+        
+        if today_usage >= daily_limit:
+            logger.warning(f"今日grok-4-free使用次数已达上限: {today_usage}/{daily_limit}", "TokenManager")
+            return False
+            
+        # 更新使用记录（这里记录全局使用次数，也可以按token记录）
+        global_key = "global"
+        if global_key not in self.free_grok4_usage[today]:
+            self.free_grok4_usage[today][global_key] = 0
+        self.free_grok4_usage[today][global_key] += 1
+        
+        # 清理过期记录（保留最近7天）
+        self.cleanup_old_usage_records()
+        self.save_daily_usage()
+        
+        return True
+        
+    def cleanup_old_usage_records(self):
+        """清理过期的使用记录"""
+        import datetime
+        today = datetime.datetime.now()
+        keep_days = 7  # 保留7天的记录
+        
+        keys_to_remove = []
+        for date_key in self.free_grok4_usage.keys():
+            try:
+                record_date = datetime.datetime.strptime(date_key, "%Y-%m-%d")
+                if (today - record_date).days > keep_days:
+                    keys_to_remove.append(date_key)
+            except ValueError:
+                # 日期格式错误的记录也删除
+                keys_to_remove.append(date_key)
+                
+        for key in keys_to_remove:
+            del self.free_grok4_usage[key]
     def add_token(self, token,isinitialization=False):
         sso = token.split("sso=")[1].split(";")[0]
         for model in self.model_config.keys():
+            # grok-4 只给 SSO_PRO 令牌使用，普通令牌使用 grok-4-free
+            if model == "grok-4":
+                continue
+                
             if model not in self.token_model_map:
                 self.token_model_map[model] = []
             if sso not in self.token_status_map:
@@ -329,6 +420,18 @@ class AuthTokenManager:
             
             token_entry["RequestCount"] = new_count
             
+            # 如果是 grok-4-free，也需要减少每日使用计数
+            if normalized_model == "grok-4-free":
+                today = self.get_today_key()
+                if today in self.free_grok4_usage:
+                    global_key = "global"
+                    if global_key in self.free_grok4_usage[today]:
+                        self.free_grok4_usage[today][global_key] = max(
+                            0, 
+                            self.free_grok4_usage[today][global_key] - reduction
+                        )
+                        self.save_daily_usage()
+            
             # 更新token状态
             if token_entry["token"]:
                 sso = token_entry["token"].split("sso=")[1].split(";")[0]
@@ -367,6 +470,44 @@ class AuthTokenManager:
                 if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
                     self.remove_pro_token_from_model(normalized_model, token_entry["token"])
                     next_token_entry = self.pro_token_model_map[normalized_model][0] if self.pro_token_model_map[normalized_model] else None
+                    return next_token_entry["token"] if next_token_entry else None
+
+                sso = token_entry["token"].split("sso=")[1].split(";")[0]
+                if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                    if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
+                        self.token_status_map[sso][normalized_model]["isValid"] = False
+                        self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
+                    self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
+
+                    self.save_token_status()
+
+                return token_entry["token"]
+        elif normalized_model == "grok-4-free":
+            # grok-4-free 使用普通SSO令牌，但需要检查每日使用限制
+            if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
+                return None
+
+            # 检查今日是否已达到使用限制
+            if not self.check_and_update_daily_usage(normalized_model, is_return):
+                return None
+
+            token_entry = self.token_model_map[normalized_model][0]
+            if is_return:
+                return token_entry["token"]
+
+            if token_entry:
+                if token_entry["StartCallTime"] is None:
+                    token_entry["StartCallTime"] = int(time.time() * 1000)
+
+                if not self.token_reset_switch:
+                    self.start_token_reset_process()
+                    self.token_reset_switch = True
+
+                token_entry["RequestCount"] += 1
+
+                if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
+                    self.remove_token_from_model(normalized_model, token_entry["token"])
+                    next_token_entry = self.token_model_map[normalized_model][0] if self.token_model_map[normalized_model] else None
                     return next_token_entry["token"] if next_token_entry else None
 
                 sso = token_entry["token"].split("sso=")[1].split(";")[0]
@@ -477,7 +618,7 @@ class AuthTokenManager:
         return list(self.expired_tokens)
 
     def normalize_model_name(self, model):
-        if model.startswith('grok-') and 'deepsearch' not in model and 'reasoning' not in model:
+        if model.startswith('grok-') and 'deepsearch' not in model and 'reasoning' not in model and 'free' not in model:
             return '-'.join(model.split('-')[:2])
         return model
 
@@ -494,6 +635,21 @@ class AuthTokenManager:
         for model in self.model_config.keys():
             if model == "grok-4":
                 model_tokens = self.pro_token_model_map.get(model, [])
+            elif model == "grok-4-free":
+                # grok-4-free 需要考虑每日限制
+                model_tokens = self.token_model_map.get(model, [])
+                today = self.get_today_key()
+                today_usage = sum(self.free_grok4_usage.get(today, {}).values())
+                daily_limit = 10
+                daily_remaining = max(0, daily_limit - today_usage)
+                
+                model_request_frequency = self.model_config[model]["RequestFrequency"]
+                total_used_requests = sum(token_entry.get("RequestCount", 0) for token_entry in model_tokens)
+                token_remaining = (len(model_tokens) * model_request_frequency) - total_used_requests
+                
+                # 返回两者的最小值
+                remaining_capacity_map[model] = max(0, min(token_remaining, daily_remaining))
+                continue
             else:
                 model_tokens = self.token_model_map.get(model, [])
             
@@ -1082,6 +1238,10 @@ def process_model_response(response, model):
             CONFIG["IS_THINKING"] = False
         else:
             result["token"] = response.get("token")
+    elif model == 'grok-4':
+        result["token"] = response.get("token")
+    elif model == 'grok-4-free':
+        result["token"] = response.get("token")
 
     return result
 
@@ -1330,7 +1490,28 @@ def manager():
 def get_manager_tokens():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(token_manager.get_token_status_map())
+    
+    # 获取基本令牌状态
+    token_status = token_manager.get_token_status_map()
+    
+    # 添加每日使用情况信息
+    today = token_manager.get_today_key()
+    daily_usage = token_manager.free_grok4_usage.get(today, {})
+    today_usage = sum(daily_usage.values())
+    
+    result = {
+        "tokens": token_status,
+        "dailyUsage": {
+            "today": today,
+            "grok4Free": {
+                "used": today_usage,
+                "limit": 10,
+                "remaining": max(0, 10 - today_usage)
+            }
+        }
+    }
+    
+    return jsonify(result)
 
 @app.route('/manager/api/add', methods=['POST'])
 def add_manager_token():
@@ -1459,6 +1640,23 @@ def chat_completions():
         data = request.json
         model = data.get("model")
         stream = data.get("stream", False)
+        
+        # 如果用户请求 grok-4，自动选择合适的实现
+        if model == "grok-4":
+            # 优先使用 SSO_PRO 令牌的 grok-4
+            if token_manager.get_token_count_for_model("grok-4") > 0:
+                model = "grok-4"
+            # 如果没有 SSO_PRO 令牌，使用普通令牌的 grok-4-free  
+            elif token_manager.get_token_count_for_model("grok-4-free") > 0:
+                model = "grok-4-free"
+                logger.info("使用普通账号的grok-4-free服务", "Server")
+            else:
+                return jsonify({
+                    "error": {
+                        "message": "grok-4 模型暂无可用令牌，请稍后重试",
+                        "type": "server_error"
+                    }
+                }), 429
 
         retry_count = 0
         is_network_error_retry = False
